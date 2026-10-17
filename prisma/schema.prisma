@@ -1,0 +1,435 @@
+// Prisma Schema for ErytnaBusana POS
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// User & Role
+model User {
+  id           String      @id @default(uuid())
+  username     String      @unique
+  name         String
+  email        String?     @unique
+  passwordHash String
+  role         String      @default("KASIR") // ADMIN, KASIR, PETUGAS_STOK
+  isActive     Boolean     @default(true)
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  sales        Sale[]
+  purchases    Purchase[]
+  movements    InventoryMovement[]
+  shifts       CashShift[]
+  auditLogs    AuditLog[]
+  returns      SaleReturn[]
+
+  @@map("users")
+}
+
+// Category
+model Category {
+  id          String    @id @default(uuid())
+  name        String    @unique
+  description String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  products    Product[]
+
+  @@map("categories")
+}
+
+// Unit of Measurement
+model Unit {
+  id          String    @id @default(uuid())
+  name        String    @unique // Pcs, Lusin, Meter, Yard, Gulung
+  symbol      String    // pcs, lsn, m, yd, glg
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  products    Product[]
+
+  @@map("units")
+}
+
+// Product
+model Product {
+  id           String    @id @default(uuid())
+  name         String
+  sku          String    @unique
+  barcode      String?   @unique
+  categoryId   String
+  unitId       String
+  brand        String?
+  description  String?
+  costPrice    Float     @default(0)   // Harga modal
+  retailPrice  Float     @default(0)   // Harga eceran
+  minStock     Float     @default(5)   // Batas minimum stok
+  allowDecimal Boolean   @default(false) // Untuk kain meteran/yard
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  category     Category  @relation(fields: [categoryId], references: [id])
+  unit         Unit      @relation(fields: [unitId], references: [id])
+  variants     ProductVariant[]
+  priceTiers   PriceTier[]
+  inventory    Inventory?
+  movements    InventoryMovement[]
+  saleItems    SaleItem[]
+  purchaseItems PurchaseItem[]
+  returnItems  ReturnItem[]
+
+  @@index([name])
+  @@index([sku])
+  @@index([barcode])
+  @@index([categoryId])
+  @@map("products")
+}
+
+// Product Variant (Warna, Ukuran, Motif)
+model ProductVariant {
+  id           String    @id @default(uuid())
+  productId    String
+  name         String    // e.g., "Merah Cabai - 50m", "Putih - No 4"
+  color        String?
+  size         String?
+  sku          String    @unique
+  barcode      String?   @unique
+  costPrice    Float     @default(0)
+  retailPrice  Float     @default(0)
+  minStock     Float     @default(5)
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  product      Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  priceTiers   PriceTier[]
+  inventory    Inventory?
+  movements    InventoryMovement[]
+  saleItems    SaleItem[]
+  purchaseItems PurchaseItem[]
+  returnItems  ReturnItem[]
+
+  @@index([sku])
+  @@index([barcode])
+  @@index([productId])
+  @@map("product_variants")
+}
+
+// Tiered Pricing for Wholesale (Harga Grosir Bertingkat)
+model PriceTier {
+  id          String          @id @default(uuid())
+  productId   String
+  variantId   String?
+  minQty      Float           // Batas bawah kuantitas, e.g. 12
+  maxQty      Float?          // Batas atas kuantitas opsional, e.g. 99 (null = unlimited)
+  price       Float           // Harga per unit grosir
+  tierName    String?         // Label opsional: e.g. "Grosir Sedang", "Grosir Besar"
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  product     Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variant     ProductVariant? @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@index([variantId])
+  @@map("price_tiers")
+}
+
+// Inventory Stock Current Balance
+model Inventory {
+  id          String          @id @default(uuid())
+  productId   String          @unique
+  variantId   String?         @unique
+  quantity    Float           @default(0)
+  minStock    Float           @default(5)
+  updatedAt   DateTime        @updatedAt
+
+  product     Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variant     ProductVariant? @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@map("inventory")
+}
+
+// Inventory Movements (Audit Trail for every stock delta)
+// Types: INITIAL, PURCHASE_IN, SALE_OUT, CUSTOMER_RETURN, SUPPLIER_RETURN, DAMAGED, LOST, ADJUSTMENT
+model InventoryMovement {
+  id             String          @id @default(uuid())
+  productId      String
+  variantId      String?
+  movementType   String          // INITIAL, PURCHASE_IN, SALE_OUT, CUSTOMER_RETURN, SUPPLIER_RETURN, DAMAGED, LOST, ADJUSTMENT
+  quantity       Float           // Delta quantity (e.g., -2 or +10)
+  previousStock  Float
+  resultingStock Float
+  referenceId    String?         // Sale ID, Purchase ID, Stock Opname Ref
+  reason         String?
+  userId         String?
+  createdAt      DateTime        @default(now())
+
+  product        Product         @relation(fields: [productId], references: [id])
+  variant        ProductVariant? @relation(fields: [variantId], references: [id])
+  user           User?           @relation(fields: [userId], references: [id])
+
+  @@index([productId])
+  @@index([movementType])
+  @@index([createdAt])
+  @@map("inventory_movements")
+}
+
+// Customer
+model Customer {
+  id          String    @id @default(uuid())
+  name        String
+  phone       String?
+  type        String    @default("UMUM") // UMUM, ECERAN, GROSIR
+  notes       String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  sales       Sale[]
+
+  @@map("customers")
+}
+
+// Supplier
+model Supplier {
+  id            String     @id @default(uuid())
+  name          String
+  contactPerson String?
+  phone         String?
+  address       String?
+  notes         String?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  purchases     Purchase[]
+
+  @@map("suppliers")
+}
+
+// Purchase / Pembelian dari Supplier
+model Purchase {
+  id            String         @id @default(uuid())
+  invoiceNumber String         @unique // Nomor faktur pembelian
+  supplierId    String
+  purchaseDate  DateTime       @default(now())
+  totalAmount   Float          @default(0)
+  status        String         @default("DRAFT") // DRAFT, RECEIVED, CANCELLED
+  receivedDate  DateTime?
+  notes         String?
+  userId        String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  supplier      Supplier       @relation(fields: [supplierId], references: [id])
+  user          User?          @relation(fields: [userId], references: [id])
+  items         PurchaseItem[]
+
+  @@index([invoiceNumber])
+  @@index([purchaseDate])
+  @@map("purchases")
+}
+
+model PurchaseItem {
+  id          String          @id @default(uuid())
+  purchaseId  String
+  productId   String
+  variantId   String?
+  quantity    Float
+  unitCost    Float           // Harga beli per unit
+  subtotal    Float
+  createdAt   DateTime        @default(now())
+
+  purchase    Purchase        @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  product     Product         @relation(fields: [productId], references: [id])
+  variant     ProductVariant? @relation(fields: [variantId], references: [id])
+
+  @@map("purchase_items")
+}
+
+// Sale / Transaksi Penjualan POS
+model Sale {
+  id             String        @id @default(uuid())
+  invoiceNumber  String        @unique // Nomor nota e.g. EB-20261017-0001
+  date           DateTime      @default(now())
+  customerId     String?
+  customerName   String        @default("Pelanggan Umum")
+  cashierId      String
+  cashierName    String
+  subtotal       Float
+  discount       Float         @default(0)
+  totalAmount    Float
+  paymentMethod  String        @default("CASH") // CASH, TRANSFER, QRIS, DEBIT, CREDIT
+  status         String        @default("COMPLETED") // COMPLETED, CANCELLED, PARTIALLY_RETURNED, RETURNED
+  cancelReason   String?
+  cancelledAt    DateTime?
+  cancelledBy    String?
+  idempotencyKey String?       @unique // Mencegah double submit transaksi
+  notes          String?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  customer       Customer?     @relation(fields: [customerId], references: [id])
+  cashier        User          @relation(fields: [cashierId], references: [id])
+  items          SaleItem[]
+  payments       Payment[]
+  returns        SaleReturn[]
+
+  @@index([invoiceNumber])
+  @@index([date])
+  @@index([cashierId])
+  @@index([status])
+  @@map("sales")
+}
+
+// Snapshot Item Penjualan
+model SaleItem {
+  id          String          @id @default(uuid())
+  saleId      String
+  productId   String
+  variantId   String?
+  productName String
+  unitName    String
+  quantity    Float
+  unitPrice   Float           // Snapshot harga jual per unit yang berlaku
+  costPrice   Float           // Snapshot harga modal per unit untuk perhitungan laba kotor
+  subtotal    Float
+  tierUsed    String?         // Keterangan tingkat harga: "Eceran", "Grosir (>=12)", dll.
+  createdAt   DateTime        @default(now())
+
+  sale        Sale            @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  product     Product         @relation(fields: [productId], references: [id])
+  variant     ProductVariant? @relation(fields: [variantId], references: [id])
+  returnItems ReturnItem[]
+
+  @@map("sale_items")
+}
+
+// Payment Record
+model Payment {
+  id             String    @id @default(uuid())
+  saleId         String
+  method         String    // CASH, TRANSFER, QRIS, DEBIT, CREDIT
+  amountPaid     Float     // Total yang harus dibayar / dialokasikan
+  amountTendered Float     // Uang yang diserahkan pembeli (untuk tunai)
+  changeAmount   Float     @default(0) // Uang kembalian
+  referenceNumber String?  // Nomor transfer / approval code non-tunai
+  notes          String?
+  createdAt      DateTime  @default(now())
+
+  sale           Sale      @relation(fields: [saleId], references: [id], onDelete: Cascade)
+
+  @@map("payments")
+}
+
+// Sale Return / Retur Penjualan
+model SaleReturn {
+  id           String       @id @default(uuid())
+  returnNumber String       @unique
+  saleId       String
+  returnDate   DateTime     @default(now())
+  reason       String
+  totalRefund  Float        @default(0)
+  userId       String
+  createdAt    DateTime     @default(now())
+
+  sale         Sale         @relation(fields: [saleId], references: [id])
+  user         User         @relation(fields: [userId], references: [id])
+  items        ReturnItem[]
+
+  @@map("sale_returns")
+}
+
+model ReturnItem {
+  id           String          @id @default(uuid())
+  returnId     String
+  saleItemId   String
+  productId    String
+  variantId    String?
+  quantity     Float
+  refundAmount Float
+  condition    String          @default("RESTOCKABLE") // RESTOCKABLE, DAMAGED
+  notes        String?
+  createdAt    DateTime        @default(now())
+
+  returnRecord SaleReturn      @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  saleItem     SaleItem        @relation(fields: [saleItemId], references: [id])
+  product      Product         @relation(fields: [productId], references: [id])
+  variant      ProductVariant? @relation(fields: [variantId], references: [id])
+
+  @@map("return_items")
+}
+
+// Shift Kasir
+model CashShift {
+  id                 String         @id @default(uuid())
+  cashierId          String
+  cashierName        String
+  openedAt           DateTime       @default(now())
+  closedAt           DateTime?
+  startingCash       Float          @default(0)
+  endingCashExpected Float?
+  endingCashActual   Float?
+  discrepancy        Float?
+  status             String         @default("OPEN") // OPEN, CLOSED
+  notes              String?
+
+  cashier            User           @relation(fields: [cashierId], references: [id])
+  movements          CashMovement[]
+
+  @@map("cash_shifts")
+}
+
+model CashMovement {
+  id           String     @id @default(uuid())
+  shiftId      String
+  movementType String     // CASH_IN, CASH_OUT
+  amount       Float
+  reason       String
+  createdAt    DateTime   @default(now())
+
+  shift        CashShift  @relation(fields: [shiftId], references: [id], onDelete: Cascade)
+
+  @@map("cash_movements")
+}
+
+// Audit Trail Log
+model AuditLog {
+  id         String    @id @default(uuid())
+  userId     String?
+  userName   String?
+  action     String    // LOGIN, LOGOUT, CREATE_PRODUCT, VOID_SALE, STOCK_OPNAME, etc.
+  entity     String    // SALE, PRODUCT, USER, INVENTORY, SETTING
+  entityId   String?
+  details    String?   // JSON representation of changes
+  ipAddress  String?
+  createdAt  DateTime  @default(now())
+
+  user       User?     @relation(fields: [userId], references: [id])
+
+  @@index([action])
+  @@index([entity])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// Store Setting (Toko ErytnaBusana)
+model StoreSetting {
+  id                 String   @id @default("default")
+  storeName          String   @default("ErytnaBusana")
+  tagline            String?  @default("Toko Alat Jahit & Perlengkapan Busana")
+  phone              String?  @default("0812-3456-7890")
+  address            String?  @default("Jl. Raya Busana No. 123, Pasar Tekstil")
+  receiptHeader      String?  @default("Selamat Datang di ErytnaBusana")
+  receiptFooter      String?  @default("Terima Kasih Atas Kunjungan Anda! Barang yang sudah dibeli dapat ditukar maksimal 2 hari dengan nota.")
+  allowNegativeStock Boolean  @default(false)
+  updatedAt          DateTime @updatedAt
+
+  @@map("store_settings")
+}
