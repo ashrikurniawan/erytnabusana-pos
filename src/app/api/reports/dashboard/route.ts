@@ -72,6 +72,30 @@ export async function GET() {
       .sort((a, b) => b.quantity - a.quantity)
       .slice(0, 5);
 
+    // Last 7 days revenue breakdown
+    const last7Days: { date: string; revenue: number }[] = [];
+    for (let i = 6; i >= 0; i--) {
+      const dayStart = new Date();
+      dayStart.setDate(dayStart.getDate() - i);
+      dayStart.setHours(0, 0, 0, 0);
+
+      const dayEnd = new Date();
+      dayEnd.setDate(dayEnd.getDate() - i);
+      dayEnd.setHours(23, 59, 59, 999);
+
+      const daySales = await prisma.sale.findMany({
+        where: {
+          date: { gte: dayStart, lte: dayEnd },
+          status: { not: "CANCELLED" },
+        },
+        select: { totalAmount: true },
+      });
+
+      const dayRevenue = daySales.reduce((sum, s) => sum + s.totalAmount, 0);
+      const label = dayStart.toLocaleDateString("id-ID", { day: "2-digit", month: "short" });
+      last7Days.push({ date: label, revenue: dayRevenue });
+    }
+
     // Low stock items (currentStock <= minStock)
     const productsWithStock = await prisma.product.findMany({
       where: { isActive: true },
@@ -106,6 +130,7 @@ export async function GET() {
       },
       topProducts,
       lowStockItems,
+      last7Days,
     });
   } catch (error) {
     console.error("Dashboard error:", error);

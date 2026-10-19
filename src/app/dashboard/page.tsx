@@ -11,8 +11,61 @@ import {
   AlertTriangle,
   ArrowRight,
   Package,
+  BarChart2,
 } from "lucide-react";
 import Link from "next/link";
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+} from "recharts";
+
+interface DashboardData {
+  summary: {
+    revenueToday: number;
+    transactionsToday: number;
+    averageOrderValue: number;
+    grossProfitToday: number;
+    paymentMethods: Record<string, number>;
+  };
+  topProducts: { name: string; quantity: number; revenue: number }[];
+  lowStockItems: {
+    id: string;
+    name: string;
+    sku: string;
+    category: string;
+    unit: string;
+    quantity: number;
+    minStock: number;
+    status: string;
+  }[];
+  last7Days: { date: string; revenue: number }[];
+}
+
+// Custom Tooltip for Recharts bar
+function CustomTooltip({
+  active,
+  payload,
+  label,
+}: {
+  active?: boolean;
+  payload?: { value: number }[];
+  label?: string;
+}) {
+  if (active && payload && payload.length) {
+    return (
+      <div className="bg-white border border-violet-200 rounded-xl shadow-lg px-3 py-2 text-xs">
+        <p className="text-slate-500 font-medium mb-0.5">{label}</p>
+        <p className="text-violet-700 font-bold">{formatRupiah(payload[0].value)}</p>
+      </div>
+    );
+  }
+  return null;
+}
 
 export default function DashboardPage() {
   const [currentUser, setCurrentUser] = useState<{
@@ -22,27 +75,7 @@ export default function DashboardPage() {
     role: "ADMIN" | "KASIR" | "PETUGAS_STOK";
   } | null>(null);
 
-  const [dashboardData, setDashboardData] = useState<{
-    summary: {
-      revenueToday: number;
-      transactionsToday: number;
-      averageOrderValue: number;
-      grossProfitToday: number;
-      paymentMethods: Record<string, number>;
-    };
-    topProducts: { name: string; quantity: number; revenue: number }[];
-    lowStockItems: {
-      id: string;
-      name: string;
-      sku: string;
-      category: string;
-      unit: string;
-      quantity: number;
-      minStock: number;
-      status: string;
-    }[];
-  } | null>(null);
-
+  const [dashboardData, setDashboardData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -84,11 +117,15 @@ export default function DashboardPage() {
     );
   }
 
-  const { summary, topProducts, lowStockItems } = dashboardData || {
+  const { summary, topProducts, lowStockItems, last7Days } = dashboardData || {
     summary: { revenueToday: 0, transactionsToday: 0, averageOrderValue: 0, grossProfitToday: 0, paymentMethods: {} },
     topProducts: [],
     lowStockItems: [],
+    last7Days: [],
   };
+
+  // Check if all last7Days are zero (no data)
+  const hasChartData = last7Days.some((d) => d.revenue > 0);
 
   return (
     <div className="flex h-screen bg-slate-100 overflow-hidden font-sans">
@@ -160,16 +197,68 @@ export default function DashboardPage() {
 
             {/* Estimasi Laba Kotor */}
             <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex items-center space-x-4">
-              <div className="w-12 h-12 rounded-xl bg-purple-50 text-purple-600 flex items-center justify-center shrink-0">
+              <div className="w-12 h-12 rounded-xl bg-brand-50 text-brand-600 flex items-center justify-center shrink-0">
                 <DollarSign className="w-6 h-6" />
               </div>
               <div>
                 <p className="text-xs font-semibold text-slate-500">Estimasi Laba Kotor</p>
-                <h3 className="text-lg font-bold text-purple-700 mt-0.5">
+                <h3 className="text-lg font-bold text-brand-700 mt-0.5">
                   {formatRupiah(summary.grossProfitToday)}
                 </h3>
               </div>
             </div>
+          </div>
+
+          {/* Bar Chart: 7 Hari Terakhir */}
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-100 mb-5">
+              <h3 className="font-bold text-sm text-slate-800 flex items-center gap-2">
+                <BarChart2 className="w-4 h-4 text-brand-600" />
+                Pendapatan 7 Hari Terakhir
+              </h3>
+              <Link href="/reports" className="text-xs text-brand-600 hover:underline font-medium">
+                Lihat Laporan
+              </Link>
+            </div>
+
+            {!hasChartData ? (
+              <div className="flex flex-col items-center justify-center py-16 text-slate-400">
+                <BarChart2 className="w-10 h-10 stroke-[1.5] opacity-30 mb-2" />
+                <p className="text-xs">Belum ada data penjualan dalam 7 hari terakhir.</p>
+              </div>
+            ) : (
+              <ResponsiveContainer width="100%" height={240}>
+                <BarChart data={last7Days} margin={{ top: 4, right: 8, left: 8, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false} />
+                  <XAxis
+                    dataKey="date"
+                    tick={{ fontSize: 11, fill: "#94a3b8" }}
+                    axisLine={false}
+                    tickLine={false}
+                  />
+                  <YAxis
+                    tick={{ fontSize: 11, fill: "#94a3b8" }}
+                    axisLine={false}
+                    tickLine={false}
+                    tickFormatter={(v) =>
+                      v >= 1_000_000
+                        ? `${(v / 1_000_000).toFixed(1)}jt`
+                        : v >= 1_000
+                        ? `${(v / 1_000).toFixed(0)}rb`
+                        : `${v}`
+                    }
+                    width={52}
+                  />
+                  <Tooltip content={<CustomTooltip />} cursor={{ fill: "#f5f3ff" }} />
+                  <Bar
+                    dataKey="revenue"
+                    fill="#8b5cf6"
+                    radius={[6, 6, 0, 0]}
+                    maxBarSize={48}
+                  />
+                </BarChart>
+              </ResponsiveContainer>
+            )}
           </div>
 
           {/* 2 Columns: Top Products & Low Stock Alerts */}
@@ -199,7 +288,7 @@ export default function DashboardPage() {
                       className="flex items-center justify-between p-2.5 rounded-xl hover:bg-slate-50 transition-colors"
                     >
                       <div className="flex items-center space-x-3">
-                        <span className="w-6 h-6 rounded-lg bg-slate-100 text-slate-700 font-bold text-xs flex items-center justify-center">
+                        <span className="w-6 h-6 rounded-lg bg-brand-100 text-brand-700 font-bold text-xs flex items-center justify-center">
                           {idx + 1}
                         </span>
                         <div>
@@ -221,7 +310,7 @@ export default function DashboardPage() {
               <div className="flex items-center justify-between pb-3 border-b border-slate-100 mb-4">
                 <h3 className="font-bold text-sm text-slate-800 flex items-center gap-2">
                   <AlertTriangle className="w-4 h-4 text-amber-500" />
-                  Peringatan Stok Menipis & Habis
+                  Peringatan Stok Menipis &amp; Habis
                 </h3>
                 <Link href="/inventory" className="text-xs text-brand-600 hover:underline font-medium">
                   Kelola Stok
