@@ -106,175 +106,191 @@ export async function POST(request: Request) {
     const setting = await prisma.storeSetting.findUnique({ where: { id: "default" } });
     const allowNegativeStock = setting?.allowNegativeStock ?? false;
 
-    // 2. Atomic Database Transaction
-    const completedSale = await prisma.$transaction(async (tx) => {
-      let calculatedSubtotal = 0;
-      const validatedItems: {
-        product: { id: string; name: string; costPrice: number; retailPrice: number; unit: { name: string } };
-        quantity: number;
-        unitPrice: number;
-        costPrice: number;
-        subtotal: number;
-        tierUsed: string;
-        currentStock: number;
-      }[] = [];
+    // Fetch all requested products and their related data in ONE query outside the transaction
+    const cartProductIds = (items as CartItemPayload[]).map((i) => i.productId).filter(Boolean);
+    const productsFromDb = await prisma.product.findMany({
+      where: { id: { in: cartProductIds } },
+      include: {
+        unit: true,
+        inventory: true,
+        priceTiers: { orderBy: { minQty: "asc" } },
+      },
+    });
 
-      for (const cartItem of items as CartItemPayload[]) {
-        if (!cartItem.productId || !cartItem.quantity || cartItem.quantity <= 0) {
-          throw new Error("Item produk atau jumlah tidak valid.");
-        }
+    const productMap = new Map(productsFromDb.map((p) => [p.id, p]));
 
-        const product = await tx.product.findUnique({
-          where: { id: cartItem.productId },
-          include: {
-            unit: true,
-            inventory: true,
-            priceTiers: { orderBy: { minQty: "asc" } },
-          },
-        });
+    let calculatedSubtotal = 0;
+    const validatedItems: {
+      product: (typeof productsFromDb)[0];
+      quantity: number;
+      unitPrice: number;
+      costPrice: number;
+      subtotal: number;
+      tierUsed: string;
+      currentStock: number;
+    }[] = [];
 
-        if (!product || !product.isActive) {
-          throw new Error(`Produk tidak ditemukan atau berstatus tidak aktif.`);
-        }
+    for (const cartItem of items as CartItemPayload[]) {
+      if (!cartItem.productId || !cartItem.quantity || cartItem.quantity <= 0) {
+        return NextResponse.json({ error: "Item produk atau jumlah tidak valid." }, { status: 400 });
+      }
 
-        const currentStock = product.inventory?.quantity ?? 0;
-
-        // Acceptance Test 4: Validate stock
-        if (!allowNegativeStock && currentStock < cartItem.quantity) {
-          throw new Error(
-            `Stok untuk "${product.name}" tidak mencukupi (Tersedia: ${currentStock} ${product.unit.name}, Diminta: ${cartItem.quantity} ${product.unit.name}).`
-          );
-        }
-
-        // Authoritative server-side price tier calculation (Acceptance Test 1 & 2)
-        const pricing = calculateItemPrice(
-          product.retailPrice,
-          product.costPrice,
-          product.priceTiers,
-          cartItem.quantity
+      const product = productMap.get(cartItem.productId);
+      if (!product || !product.isActive) {
+        return NextResponse.json(
+          { error: `Produk tidak ditemukan atau berstatus tidak aktif.` },
+          { status: 400 }
         );
-
-        calculatedSubtotal += pricing.subtotal;
-
-        validatedItems.push({
-          product,
-          quantity: cartItem.quantity,
-          unitPrice: pricing.unitPrice,
-          costPrice: product.costPrice,
-          subtotal: pricing.subtotal,
-          tierUsed: pricing.tierName,
-          currentStock,
-        });
       }
 
-      const parsedDiscount = Math.max(0, parseFloat(discount) || 0);
-      const totalAmount = Math.max(0, calculatedSubtotal - parsedDiscount);
-      const tendered = parseFloat(amountTendered) || 0;
+      const currentStock = product.inventory?.quantity ?? 0;
 
-      // Acceptance Test 3: Cash tendered validation
-      if (paymentMethod === "CASH") {
-        if (tendered < totalAmount) {
-          throw new Error(
-            `Nominal uang yang diserahkan (Rp ${tendered.toLocaleString("id-ID")}) kurang dari total belanja (Rp ${totalAmount.toLocaleString("id-ID")}).`
-          );
+      // Validate stock
+      if (!allowNegativeStock && currentStock < cartItem.quantity) {
+        return NextResponse.json(
+          {
+            error: `Stok untuk "${product.name}" tidak mencukupi (Tersedia: ${currentStock} ${product.unit.name}, Diminta: ${cartItem.quantity} ${product.unit.name}).`,
+          },
+          { status: 400 }
+        );
+      }
+
+      const pricing = calculateItemPrice(
+        product.retailPrice,
+        product.costPrice,
+        product.priceTiers,
+        cartItem.quantity
+      );
+
+      calculatedSubtotal += pricing.subtotal;
+
+      validatedItems.push({
+        product,
+        quantity: cartItem.quantity,
+        unitPrice: pricing.unitPrice,
+        costPrice: product.costPrice,
+        subtotal: pricing.subtotal,
+        tierUsed: pricing.tierName,
+        currentStock,
+      });
+    }
+
+    const parsedDiscount = Math.max(0, parseFloat(discount) || 0);
+    const totalAmount = Math.max(0, calculatedSubtotal - parsedDiscount);
+    const tendered = parseFloat(amountTendered) || 0;
+
+    // Cash tendered validation
+    if (paymentMethod === "CASH") {
+      if (tendered < totalAmount) {
+        return NextResponse.json(
+          {
+            error: `Nominal uang yang diserahkan (Rp ${tendered.toLocaleString("id-ID")}) kurang dari total belanja (Rp ${totalAmount.toLocaleString("id-ID")}).`,
+          },
+          { status: 400 }
+        );
+      }
+    }
+
+    const changeAmount = paymentMethod === "CASH" ? Math.max(0, tendered - totalAmount) : 0;
+
+    // Generate invoice prefix outside transaction
+    const today = new Date();
+    const yyyy = today.getFullYear();
+    const mm = String(today.getMonth() + 1).padStart(2, "0");
+    const dd = String(today.getDate()).padStart(2, "0");
+    const prefix = `EB-${yyyy}${mm}${dd}`;
+
+    // 2. Atomic Database Transaction with generous timeout configuration
+    const createdSaleId = await prisma.$transaction(
+      async (tx) => {
+        const countToday = await tx.sale.count({
+          where: {
+            invoiceNumber: { startsWith: prefix },
+          },
+        });
+        const invoiceNumber = `${prefix}-${String(countToday + 1).padStart(4, "0")}`;
+
+        // 1. Create Sale, Items, and Payment in a SINGLE nested create query
+        const sale = await tx.sale.create({
+          data: {
+            invoiceNumber,
+            date: today,
+            customerId: customerId || null,
+            customerName: customerName || "Pelanggan Umum",
+            cashierId: user.id,
+            cashierName: user.name,
+            subtotal: calculatedSubtotal,
+            discount: parsedDiscount,
+            totalAmount,
+            paymentMethod,
+            status: "COMPLETED",
+            idempotencyKey: idempotencyKey || null,
+            notes: notes ? notes.trim() : null,
+            items: {
+              create: validatedItems.map((item) => ({
+                productId: item.product.id,
+                productName: item.product.name,
+                unitName: item.product.unit.name,
+                quantity: item.quantity,
+                unitPrice: item.unitPrice,
+                costPrice: item.costPrice,
+                subtotal: item.subtotal,
+                tierUsed: item.tierUsed,
+              })),
+            },
+            payments: {
+              create: {
+                method: paymentMethod,
+                amountPaid: totalAmount,
+                amountTendered: paymentMethod === "CASH" ? tendered : totalAmount,
+                changeAmount,
+                referenceNumber: paymentMethod !== "CASH" ? `PAY-${invoiceNumber}` : null,
+                notes: notes || null,
+              },
+            },
+          },
+        });
+
+        // 2. Update Inventory and Record Movements atomically
+        for (const item of validatedItems) {
+          const newStock = item.currentStock - item.quantity;
+
+          await tx.inventory.upsert({
+            where: { productId: item.product.id },
+            update: { quantity: newStock },
+            create: { productId: item.product.id, quantity: newStock },
+          });
+
+          await tx.inventoryMovement.create({
+            data: {
+              productId: item.product.id,
+              movementType: "SALE_OUT",
+              quantity: -item.quantity,
+              previousStock: item.currentStock,
+              resultingStock: newStock,
+              referenceId: sale.id,
+              reason: `Penjualan Kasir Nota #${invoiceNumber}`,
+              userId: user.id,
+            },
+          });
         }
+
+        return sale.id;
+      },
+      {
+        maxWait: 15000,
+        timeout: 30000,
       }
+    );
 
-      const changeAmount = paymentMethod === "CASH" ? Math.max(0, tendered - totalAmount) : 0;
-
-      // Generate invoice number: EB-YYYYMMDD-XXXX
-      const today = new Date();
-      const yyyy = today.getFullYear();
-      const mm = String(today.getMonth() + 1).padStart(2, "0");
-      const dd = String(today.getDate()).padStart(2, "0");
-      const prefix = `EB-${yyyy}${mm}${dd}`;
-
-      const countToday = await tx.sale.count({
-        where: {
-          invoiceNumber: { startsWith: prefix },
-        },
-      });
-      const invoiceNumber = `${prefix}-${String(countToday + 1).padStart(4, "0")}`;
-
-      // Create Sale record
-      const sale = await tx.sale.create({
-        data: {
-          invoiceNumber,
-          date: today,
-          customerId: customerId || null,
-          customerName: customerName || "Pelanggan Umum",
-          cashierId: user.id,
-          cashierName: user.name,
-          subtotal: calculatedSubtotal,
-          discount: parsedDiscount,
-          totalAmount,
-          paymentMethod,
-          status: "COMPLETED",
-          idempotencyKey: idempotencyKey || null,
-          notes: notes ? notes.trim() : null,
-        },
-      });
-
-      // Create Sale Items & Decrement Inventory atomically
-      for (const item of validatedItems) {
-        await tx.saleItem.create({
-          data: {
-            saleId: sale.id,
-            productId: item.product.id,
-            productName: item.product.name,
-            unitName: item.product.unit.name,
-            quantity: item.quantity,
-            unitPrice: item.unitPrice,
-            costPrice: item.costPrice,
-            subtotal: item.subtotal,
-            tierUsed: item.tierUsed,
-          },
-        });
-
-        const newStock = item.currentStock - item.quantity;
-
-        await tx.inventory.upsert({
-          where: { productId: item.product.id },
-          update: { quantity: newStock },
-          create: { productId: item.product.id, quantity: newStock },
-        });
-
-        // Record stock movement (Acceptance Test 1 & 2)
-        await tx.inventoryMovement.create({
-          data: {
-            productId: item.product.id,
-            movementType: "SALE_OUT",
-            quantity: -item.quantity,
-            previousStock: item.currentStock,
-            resultingStock: newStock,
-            referenceId: sale.id,
-            reason: `Penjualan Kasir Nota #${invoiceNumber}`,
-            userId: user.id,
-          },
-        });
-      }
-
-      // Record Payment
-      await tx.payment.create({
-        data: {
-          saleId: sale.id,
-          method: paymentMethod,
-          amountPaid: totalAmount,
-          amountTendered: paymentMethod === "CASH" ? tendered : totalAmount,
-          changeAmount,
-          referenceNumber: paymentMethod !== "CASH" ? `PAY-${invoiceNumber}` : null,
-          notes: notes || null,
-        },
-      });
-
-      return await tx.sale.findUnique({
-        where: { id: sale.id },
-        include: {
-          items: true,
-          payments: true,
-          customer: true,
-        },
-      });
+    // Fetch complete sale details with relations OUTSIDE the transaction
+    const completedSale = await prisma.sale.findUnique({
+      where: { id: createdSaleId },
+      include: {
+        items: true,
+        payments: true,
+        customer: true,
+      },
     });
 
     await logAudit({
